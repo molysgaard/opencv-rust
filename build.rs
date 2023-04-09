@@ -277,13 +277,17 @@ fn build_job_server() -> Option<jobserver::Client> {
 }
 
 // todo: replace by https://github.com/rust-lang/cargo/issues/9096 when stable
-fn build_clang_generator() -> io::Result<Child> {
+fn build_clang_generator(features: &Vec<String>) -> io::Result<Child> {
 	let cargo_bin = PathBuf::from(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
 	let mut cargo = Command::new(cargo_bin);
 	// generator script is quite slow in debug mode, so we force it to be built in release mode
+    let fts = features.join(",");
 	cargo
 		.args([
 			"build",
+            "--no-default-features",
+            "--features",
+            &fts,
 			"--release",
 			"--package",
 			"opencv-binding-generator",
@@ -340,7 +344,6 @@ fn main() -> Result<()> {
 	}
 
 	let job_server = build_job_server().ok_or("Can't create job server")?;
-	let generator_build = build_clang_generator()?;
 
 	eprintln!("=== Crate version: {:?}", env::var_os("CARGO_PKG_VERSION"));
 	eprintln!("=== Environment configuration:");
@@ -355,14 +358,15 @@ fn main() -> Result<()> {
 		const PREFIX: &str = "CARGO_FEATURE_";
 		if name.starts_with(PREFIX) {
 			name.drain(..PREFIX.len());
-			Some(name)
+			Some(name.to_lowercase().replace("_", "-"))
 		} else {
 			None
 		}
-	});
-	for feature in features {
+	}).collect();
+	for feature in &features {
 		eprintln!("===   {feature}");
 	}
+	let generator_build = build_clang_generator(&features)?;
 
 	let opencv = Library::probe()?;
 	eprintln!("=== OpenCV library configuration: {opencv:#?}");

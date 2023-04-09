@@ -17,9 +17,11 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
 use std::{env, fmt};
+use std::path::{Path, PathBuf};
 
-use clang::Entity;
+use clang::{Entity, Clang};
 use dunce::canonicalize;
 use once_cell::sync::Lazy;
 
@@ -76,66 +78,137 @@ mod vector;
 mod walker;
 pub mod writer;
 
+use writer::RustNativeBindingWriter;
+use std::io::{BufReader};
+
 static EMIT_DEBUG: Lazy<bool> = Lazy::new(|| {
-	env::var("OPENCV_BINDING_GENERATOR_EMIT_DEBUG")
-		.map(|v| v == "1")
-		.unwrap_or(false)
+    env::var("OPENCV_BINDING_GENERATOR_EMIT_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 });
 
 fn get_definition_text(entity: Entity) -> String {
-	if let Some(range) = entity.get_range() {
-		let loc = range.get_start().get_spelling_location();
-		let mut source = File::open(loc.file.expect("Can't get file").get_path()).expect("Can't open source file");
-		let start = loc.offset;
-		let end = range.get_end().get_spelling_location().offset;
-		let mut def_bytes = vec![0; (end - start) as usize];
-		source.seek(SeekFrom::Start(u64::from(start))).expect("Cannot seek");
-		source.read_exact(&mut def_bytes).expect("Can't read definition");
-		String::from_utf8(def_bytes).expect("Can't parse definition")
-	} else {
-		unreachable!("Can't get entity range: {:#?}", entity)
-	}
+    if let Some(range) = entity.get_range() {
+        let loc = range.get_start().get_spelling_location();
+        let mut source = File::open(loc.file.expect("Can't get file").get_path()).expect("Can't open source file");
+        let start = loc.offset;
+        let end = range.get_end().get_spelling_location().offset;
+        let mut def_bytes = vec![0; (end - start) as usize];
+        source.seek(SeekFrom::Start(u64::from(start))).expect("Cannot seek");
+        source.read_exact(&mut def_bytes).expect("Can't read definition");
+        String::from_utf8(def_bytes).expect("Can't parse definition")
+    } else {
+        unreachable!("Can't get entity range: {:#?}", entity)
+    }
 }
 
 fn get_debug<'tu>(e: &(impl EntityElement<'tu> + fmt::Display)) -> String {
-	if *EMIT_DEBUG {
-		let loc = e
-			.entity()
-			.get_location()
-			.expect("Can't get entity location")
-			.get_file_location();
+    if *EMIT_DEBUG {
+        let loc = e
+            .entity()
+            .get_location()
+            .expect("Can't get entity location")
+            .get_file_location();
 
-		format!(
-			"// {} {}:{}",
-			e,
-			canonicalize(loc.file.expect("Can't get file for debug").get_path())
-				.expect("Can't canonicalize path")
-				.display(),
-			loc.line
-		)
-	} else {
-		"".to_string()
-	}
+        format!(
+            "// {} {}:{}",
+            e,
+            canonicalize(loc.file.expect("Can't get file for debug").get_path())
+                .expect("Can't canonicalize path")
+                .display(),
+            loc.line
+        )
+    } else {
+        "".to_string()
+    }
 }
 
 fn reserved_rename(val: Cow<str>) -> Cow<str> {
-	if let Some(&v) = settings::RESERVED_RENAME.get(val.as_ref()) {
-		v.into()
-	} else {
-		val
-	}
+    if let Some(&v) = settings::RESERVED_RENAME.get(val.as_ref()) {
+        v.into()
+    } else {
+        val
+    }
 }
 
 #[inline(always)]
 fn line_reader(mut b: impl BufRead, mut cb: impl FnMut(&str) -> bool) {
-	let mut line = String::with_capacity(256);
-	while let Ok(bytes_read) = b.read_line(&mut line) {
-		if bytes_read == 0 {
-			break;
-		}
-		if !cb(&line) {
-			break;
-		}
-		line.clear();
-	}
+    let mut line = String::with_capacity(256);
+    while let Ok(bytes_read) = b.read_line(&mut line) {
+        if bytes_read == 0 {
+            break;
+        }
+        if !cb(&line) {
+            break;
+        }
+        line.clear();
+    }
+}
+
+fn get_version_header(header_dir: &Path) -> Option<PathBuf> {
+    let out = header_dir.join("opencv2/core/version.hpp");
+    if out.is_file() {
+        Some(out)
+    } else {
+        let out = header_dir.join("opencv2.framework/Headers/core/version.hpp");
+        if out.is_file() {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn get_version_from_headers(header_dir: &Path) -> Option<String> {
+    let version_hpp = get_version_header(header_dir)?;
+    let mut major = None;
+    let mut minor = None;
+    let mut revision = None;
+    let mut line = String::with_capacity(256);
+    let mut reader = BufReader::new(File::open(version_hpp).ok()?);
+    while let Ok(bytes_read) = reader.read_line(&mut line) {
+        if bytes_read == 0 {
+            break;
+        }
+        if let Some(line) = line.strip_prefix("#define CV_VERSION_") {
+            let mut parts = line.split_whitespace();
+            if let (Some(ver_spec), Some(version)) = (parts.next(), parts.next()) {
+                match ver_spec {
+                    "MAJOR" => {
+                        major = Some(version.to_string());
+                    }
+                    "MINOR" => {
+                        minor = Some(version.to_string());
+                    }
+                    "REVISION" => {
+                        revision = Some(version.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            if major.is_some() && minor.is_some() && revision.is_some() {
+                break;
+            }
+        }
+        line.clear();
+    }
+    if let (Some(major), Some(minor), Some(revision)) = (major, minor, revision) {
+        Some(format!("{major}.{minor}.{revision}"))
+    } else {
+        None
+    }
+}
+
+
+pub fn binding_generator_as_library_function(opencv_header_dir: &Path, src_cpp_dir: &Path, out_dir: &Path, module: &str, additional_include_dirs: &Vec<PathBuf>, clang: Arc<Mutex<clang::Clang>>, debug: bool) {
+    assert!(opencv_header_dir.is_dir(), "opencv_header_dir must be exist and be a directory");
+    assert!(src_cpp_dir.is_dir(), "src_cpp_dir must be exist and be a directory");
+    assert!(out_dir.is_dir(), "out_dir must be exist and be a directory");
+
+    let version = get_version_from_headers(&opencv_header_dir).expect("Can't find the version in the headers");
+    let new_additional_include_dirs: Vec<PathBuf> = additional_include_dirs.iter().filter(|path| if path.exists() && !path.is_dir() { panic!("additional_include_dirs: {} is not a directory or does not exist", path.to_string_lossy()) } else if !path.exists() { false } else { true } ).cloned().collect();
+
+    let bindings_writer = RustNativeBindingWriter::new(&src_cpp_dir, &out_dir, module, &version, debug);
+    Generator::new(&opencv_header_dir, &new_additional_include_dirs, &src_cpp_dir, clang)
+        .process_opencv_module(module, bindings_writer);
 }

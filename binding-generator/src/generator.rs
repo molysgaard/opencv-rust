@@ -5,6 +5,7 @@ use std::fmt::Write;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use clang::diagnostic::{Diagnostic, Severity};
 use clang::{Clang, Entity, EntityKind, EntityVisitResult, Index, TranslationUnit, Type, Unsaved};
@@ -185,7 +186,7 @@ pub struct Generator {
 	opencv_include_dir: PathBuf,
 	opencv_module_header_dir: PathBuf,
 	src_cpp_dir: PathBuf,
-	clang: Clang,
+	clang: Arc<Mutex<Clang>>,
 }
 
 struct OpenCvWalker<'tu, 'r, V: GeneratorVisitor> {
@@ -453,7 +454,7 @@ impl<V: GeneratorVisitor> Drop for OpenCvWalker<'_, '_, V> {
 }
 
 impl Generator {
-	pub fn new(opencv_include_dir: &Path, additional_include_dirs: &[PathBuf], src_cpp_dir: &Path, clang: Clang) -> Self {
+	pub fn new(opencv_include_dir: &Path, additional_include_dirs: &[PathBuf], src_cpp_dir: &Path, clang: Arc<Mutex<Clang>>) -> Self {
 		let clang_bin = clang_sys::support::Clang::find(None, &[]).expect("Can't find clang binary");
 		let mut clang_include_dirs = clang_bin.cpp_search_paths.unwrap_or_default();
 		for additional_dir in additional_include_dirs {
@@ -519,7 +520,8 @@ impl Generator {
 	}
 
 	pub fn process_module(&self, module: &str, panic_on_error: bool, entity_processor: impl FnOnce(TranslationUnit, &str)) {
-		let index = Index::new(&self.clang, true, false);
+		let cclang = self.clang.lock().unwrap();
+		let index = Index::new(&cclang, true, false);
 		let mut module_file = self.src_cpp_dir.join(format!("{module}.hpp"));
 		if !module_file.exists() {
 			module_file = self.opencv_module_header_dir.join(format!("{module}.hpp"));
